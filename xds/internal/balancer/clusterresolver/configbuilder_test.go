@@ -31,11 +31,13 @@ import (
 	"google.golang.org/grpc/balancer/roundrobin"
 	"google.golang.org/grpc/balancer/weightedroundrobin"
 	"google.golang.org/grpc/balancer/weightedtarget"
+	"google.golang.org/grpc/internal/envconfig"
 	"google.golang.org/grpc/internal/hierarchy"
 	internalserviceconfig "google.golang.org/grpc/internal/serviceconfig"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/xds/internal"
 	"google.golang.org/grpc/xds/internal/balancer/clusterimpl"
+	"google.golang.org/grpc/xds/internal/balancer/outlierdetection"
 	"google.golang.org/grpc/xds/internal/balancer/priority"
 	"google.golang.org/grpc/xds/internal/balancer/ringhash"
 	"google.golang.org/grpc/xds/internal/xdsclient/xdsresource"
@@ -68,6 +70,10 @@ var (
 			})
 			return out
 		})}
+
+	noopODCfg = outlierdetection.LBConfig{
+		Interval: 1<<63 - 1,
+	}
 )
 
 func init() {
@@ -146,12 +152,14 @@ func TestBuildPriorityConfigJSON(t *testing.T) {
 					testLocalitiesP1[1],
 				},
 			},
+			childNameGen: newNameGenerator(0),
 		},
 		{
 			mechanism: DiscoveryMechanism{
 				Type: DiscoveryMechanismTypeLogicalDNS,
 			},
-			addresses: testAddressStrs[4],
+			addresses:    testAddressStrs[4],
+			childNameGen: newNameGenerator(1),
 		},
 	}, nil)
 	if err != nil {
@@ -196,13 +204,15 @@ func TestBuildPriorityConfig(t *testing.T) {
 					testLocalitiesP1[1],
 				},
 			},
+			childNameGen: newNameGenerator(0),
 		},
 		{
 			mechanism: DiscoveryMechanism{
 				Cluster: testClusterName2,
 				Type:    DiscoveryMechanismTypeLogicalDNS,
 			},
-			addresses: testAddressStrs[4],
+			addresses:    testAddressStrs[4],
+			childNameGen: newNameGenerator(1),
 		},
 	}, nil)
 
@@ -308,8 +318,144 @@ func TestBuildPriorityConfig(t *testing.T) {
 	}
 }
 
+// TestBuildPriorityConfigWithOutlierDetection tests the priority config
+// generation with Outlier Detection toggled on. Each top level balancer per
+// priority should be an Outlier Detection balancer, with a Cluster Impl
+// Balancer as a child.
+func TestBuildPriorityConfigWithOutlierDetection(t *testing.T) {
+	oldOutlierDetection := envconfig.XDSOutlierDetection
+	envconfig.XDSOutlierDetection = true
+	defer func() {
+		envconfig.XDSOutlierDetection = oldOutlierDetection
+	}()
+
+	gotConfig, _, _ := buildPriorityConfig([]priorityConfig{
+		{
+			// EDS - OD config should be the top level for both of the EDS
+			// priorities balancer This EDS priority will have multiple sub
+			// priorities. The Outlier Detection configuration specified in the
+			// Discovery Mechanism should be the top level for each sub
+			// priorities balancer.
+			mechanism: DiscoveryMechanism{
+				Cluster:          testClusterName,
+				Type:             DiscoveryMechanismTypeEDS,
+				EDSServiceName:   testEDSServiceName,
+				OutlierDetection: noopODCfg,
+			},
+			edsResp: xdsresource.EndpointsUpdate{
+				Localities: []xdsresource.Locality{
+					testLocalitiesP0[0],
+					testLocalitiesP0[1],
+					testLocalitiesP1[0],
+					testLocalitiesP1[1],
+				},
+			},
+			childNameGen: newNameGenerator(0),
+		},
+		{
+			// This OD config should wrap the Logical DNS priorities balancer.
+			mechanism: DiscoveryMechanism{
+				Cluster:          testClusterName2,
+				Type:             DiscoveryMechanismTypeLogicalDNS,
+				OutlierDetection: noopODCfg,
+			},
+			addresses:    testAddressStrs[4],
+			childNameGen: newNameGenerator(1),
+		},
+	}, nil)
+
+	wantConfig := &priority.LBConfig{
+		Children: map[string]*priority.Child{
+			"priority-0-0": {
+				Config: &internalserviceconfig.BalancerConfig{
+					Name: outlierdetection.Name,
+					Config: &outlierdetection.LBConfig{
+						Interval: 1<<63 - 1,
+						ChildPolicy: &internalserviceconfig.BalancerConfig{
+							Name: clusterimpl.Name,
+							Config: &clusterimpl.LBConfig{
+								Cluster:        testClusterName,
+								EDSServiceName: testEDSServiceName,
+								DropCategories: []clusterimpl.DropConfig{},
+								ChildPolicy: &internalserviceconfig.BalancerConfig{
+									Name: weightedtarget.Name,
+									Config: &weightedtarget.LBConfig{
+										Targets: map[string]weightedtarget.Target{
+											assertString(testLocalityIDs[0].ToString): {
+												Weight:      20,
+												ChildPolicy: &internalserviceconfig.BalancerConfig{Name: roundrobin.Name},
+											},
+											assertString(testLocalityIDs[1].ToString): {
+												Weight:      80,
+												ChildPolicy: &internalserviceconfig.BalancerConfig{Name: roundrobin.Name},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				IgnoreReresolutionRequests: true,
+			},
+			"priority-0-1": {
+				Config: &internalserviceconfig.BalancerConfig{
+					Name: outlierdetection.Name,
+					Config: &outlierdetection.LBConfig{
+						Interval: 1<<63 - 1,
+						ChildPolicy: &internalserviceconfig.BalancerConfig{
+							Name: clusterimpl.Name,
+							Config: &clusterimpl.LBConfig{
+								Cluster:        testClusterName,
+								EDSServiceName: testEDSServiceName,
+								DropCategories: []clusterimpl.DropConfig{},
+								ChildPolicy: &internalserviceconfig.BalancerConfig{
+									Name: weightedtarget.Name,
+									Config: &weightedtarget.LBConfig{
+										Targets: map[string]weightedtarget.Target{
+											assertString(testLocalityIDs[2].ToString): {
+												Weight:      20,
+												ChildPolicy: &internalserviceconfig.BalancerConfig{Name: roundrobin.Name},
+											},
+											assertString(testLocalityIDs[3].ToString): {
+												Weight:      80,
+												ChildPolicy: &internalserviceconfig.BalancerConfig{Name: roundrobin.Name},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				IgnoreReresolutionRequests: true,
+			},
+			"priority-1": {
+				Config: &internalserviceconfig.BalancerConfig{
+					Name: outlierdetection.Name,
+					Config: &outlierdetection.LBConfig{
+						Interval: 1<<63 - 1,
+						ChildPolicy: &internalserviceconfig.BalancerConfig{
+							Name: clusterimpl.Name,
+							Config: &clusterimpl.LBConfig{
+								Cluster:     testClusterName2,
+								ChildPolicy: &internalserviceconfig.BalancerConfig{Name: "pick_first"},
+							},
+						},
+					},
+				},
+				IgnoreReresolutionRequests: false,
+			},
+		},
+		Priorities: []string{"priority-0-0", "priority-0-1", "priority-1"},
+	}
+	if diff := cmp.Diff(gotConfig, wantConfig); diff != "" {
+		t.Errorf("buildPriorityConfig() diff (-got +want) %v", diff)
+	}
+}
+
 func TestBuildClusterImplConfigForDNS(t *testing.T) {
-	gotName, gotConfig, gotAddrs := buildClusterImplConfigForDNS(3, testAddressStrs[0], DiscoveryMechanism{Cluster: testClusterName2, Type: DiscoveryMechanismTypeLogicalDNS})
+	gotName, gotConfig, gotAddrs := buildClusterImplConfigForDNS(newNameGenerator(3), testAddressStrs[0], DiscoveryMechanism{Cluster: testClusterName2, Type: DiscoveryMechanismTypeLogicalDNS})
 	wantName := "priority-3"
 	wantConfig := &clusterimpl.LBConfig{
 		Cluster: testClusterName2,
@@ -335,7 +481,7 @@ func TestBuildClusterImplConfigForDNS(t *testing.T) {
 
 func TestBuildClusterImplConfigForEDS(t *testing.T) {
 	gotNames, gotConfigs, gotAddrs, _ := buildClusterImplConfigForEDS(
-		2,
+		newNameGenerator(2),
 		xdsresource.EndpointsUpdate{
 			Drops: []xdsresource.OverloadDropConfig{
 				{
@@ -465,32 +611,28 @@ func TestGroupLocalitiesByPriority(t *testing.T) {
 	tests := []struct {
 		name           string
 		localities     []xdsresource.Locality
-		wantPriorities []string
-		wantLocalities map[string][]xdsresource.Locality
+		wantLocalities [][]xdsresource.Locality
 	}{
 		{
-			name:           "1 locality 1 priority",
-			localities:     []xdsresource.Locality{testLocalitiesP0[0]},
-			wantPriorities: []string{"0"},
-			wantLocalities: map[string][]xdsresource.Locality{
-				"0": {testLocalitiesP0[0]},
+			name:       "1 locality 1 priority",
+			localities: []xdsresource.Locality{testLocalitiesP0[0]},
+			wantLocalities: [][]xdsresource.Locality{
+				{testLocalitiesP0[0]},
 			},
 		},
 		{
-			name:           "2 locality 1 priority",
-			localities:     []xdsresource.Locality{testLocalitiesP0[0], testLocalitiesP0[1]},
-			wantPriorities: []string{"0"},
-			wantLocalities: map[string][]xdsresource.Locality{
-				"0": {testLocalitiesP0[0], testLocalitiesP0[1]},
+			name:       "2 locality 1 priority",
+			localities: []xdsresource.Locality{testLocalitiesP0[0], testLocalitiesP0[1]},
+			wantLocalities: [][]xdsresource.Locality{
+				{testLocalitiesP0[0], testLocalitiesP0[1]},
 			},
 		},
 		{
-			name:           "1 locality in each",
-			localities:     []xdsresource.Locality{testLocalitiesP0[0], testLocalitiesP1[0]},
-			wantPriorities: []string{"0", "1"},
-			wantLocalities: map[string][]xdsresource.Locality{
-				"0": {testLocalitiesP0[0]},
-				"1": {testLocalitiesP1[0]},
+			name:       "1 locality in each",
+			localities: []xdsresource.Locality{testLocalitiesP0[0], testLocalitiesP1[0]},
+			wantLocalities: [][]xdsresource.Locality{
+				{testLocalitiesP0[0]},
+				{testLocalitiesP1[0]},
 			},
 		},
 		{
@@ -498,10 +640,9 @@ func TestGroupLocalitiesByPriority(t *testing.T) {
 			localities: []xdsresource.Locality{
 				testLocalitiesP0[0], testLocalitiesP0[1],
 				testLocalitiesP1[0], testLocalitiesP1[1]},
-			wantPriorities: []string{"0", "1"},
-			wantLocalities: map[string][]xdsresource.Locality{
-				"0": {testLocalitiesP0[0], testLocalitiesP0[1]},
-				"1": {testLocalitiesP1[0], testLocalitiesP1[1]},
+			wantLocalities: [][]xdsresource.Locality{
+				{testLocalitiesP0[0], testLocalitiesP0[1]},
+				{testLocalitiesP1[0], testLocalitiesP1[1]},
 			},
 		},
 		{
@@ -512,19 +653,15 @@ func TestGroupLocalitiesByPriority(t *testing.T) {
 			localities: []xdsresource.Locality{
 				testLocalitiesP1[1], testLocalitiesP0[1],
 				testLocalitiesP1[0], testLocalitiesP0[0]},
-			wantPriorities: []string{"0", "1"},
-			wantLocalities: map[string][]xdsresource.Locality{
-				"0": {testLocalitiesP0[1], testLocalitiesP0[0]},
-				"1": {testLocalitiesP1[1], testLocalitiesP1[0]},
+			wantLocalities: [][]xdsresource.Locality{
+				{testLocalitiesP0[1], testLocalitiesP0[0]},
+				{testLocalitiesP1[1], testLocalitiesP1[0]},
 			},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotPriorities, gotLocalities := groupLocalitiesByPriority(tt.localities)
-			if diff := cmp.Diff(gotPriorities, tt.wantPriorities); diff != "" {
-				t.Errorf("groupLocalitiesByPriority() diff(-got +want) %v", diff)
-			}
+			gotLocalities := groupLocalitiesByPriority(tt.localities)
 			if diff := cmp.Diff(gotLocalities, tt.wantLocalities); diff != "" {
 				t.Errorf("groupLocalitiesByPriority() diff(-got +want) %v", diff)
 			}
@@ -594,7 +731,7 @@ func TestPriorityLocalitiesToClusterImpl(t *testing.T) {
 			},
 		},
 		priorityName: "test-priority",
-		childPolicy:  &internalserviceconfig.BalancerConfig{Name: rrName},
+		childPolicy:  &internalserviceconfig.BalancerConfig{Name: roundrobin.Name},
 		mechanism: DiscoveryMechanism{
 			Cluster:        testClusterName,
 			Type:           DiscoveryMechanismTypeEDS,
@@ -652,7 +789,7 @@ func TestPriorityLocalitiesToClusterImpl(t *testing.T) {
 				},
 			},
 			priorityName: "test-priority",
-			childPolicy:  &internalserviceconfig.BalancerConfig{Name: rhName, Config: &ringhash.LBConfig{MinRingSize: 1, MaxRingSize: 2}},
+			childPolicy:  &internalserviceconfig.BalancerConfig{Name: ringhash.Name, Config: &ringhash.LBConfig{MinRingSize: 1, MaxRingSize: 2}},
 			// lrsServer is nil, so LRS policy will not be used.
 			wantConfig: &clusterimpl.LBConfig{
 				ChildPolicy: &internalserviceconfig.BalancerConfig{
@@ -979,4 +1116,78 @@ func testAddrWithAttrs(addrStr string, weight *uint32, priority string, lID *int
 	}
 	addr = hierarchy.Set(addr, path)
 	return addr
+}
+
+func TestConvertClusterImplMapToOutlierDetection(t *testing.T) {
+	tests := []struct {
+		name       string
+		ciCfgsMap  map[string]*clusterimpl.LBConfig
+		odCfg      outlierdetection.LBConfig
+		wantODCfgs map[string]*outlierdetection.LBConfig
+	}{
+		{
+			name: "single-entry-noop",
+			ciCfgsMap: map[string]*clusterimpl.LBConfig{
+				"child1": {
+					Cluster: "cluster1",
+				},
+			},
+			odCfg: outlierdetection.LBConfig{
+				Interval: 1<<63 - 1,
+			},
+			wantODCfgs: map[string]*outlierdetection.LBConfig{
+				"child1": {
+					Interval: 1<<63 - 1,
+					ChildPolicy: &internalserviceconfig.BalancerConfig{
+						Name: clusterimpl.Name,
+						Config: &clusterimpl.LBConfig{
+							Cluster: "cluster1",
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "multiple-entries-noop",
+			ciCfgsMap: map[string]*clusterimpl.LBConfig{
+				"child1": {
+					Cluster: "cluster1",
+				},
+				"child2": {
+					Cluster: "cluster2",
+				},
+			},
+			odCfg: outlierdetection.LBConfig{
+				Interval: 1<<63 - 1,
+			},
+			wantODCfgs: map[string]*outlierdetection.LBConfig{
+				"child1": {
+					Interval: 1<<63 - 1,
+					ChildPolicy: &internalserviceconfig.BalancerConfig{
+						Name: clusterimpl.Name,
+						Config: &clusterimpl.LBConfig{
+							Cluster: "cluster1",
+						},
+					},
+				},
+				"child2": {
+					Interval: 1<<63 - 1,
+					ChildPolicy: &internalserviceconfig.BalancerConfig{
+						Name: clusterimpl.Name,
+						Config: &clusterimpl.LBConfig{
+							Cluster: "cluster2",
+						},
+					},
+				},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := convertClusterImplMapToOutlierDetection(test.ciCfgsMap, test.odCfg)
+			if diff := cmp.Diff(got, test.wantODCfgs); diff != "" {
+				t.Fatalf("convertClusterImplMapToOutlierDetection() diff(-got +want) %v", diff)
+			}
+		})
+	}
 }

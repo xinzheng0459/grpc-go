@@ -1,6 +1,3 @@
-//go:build !386
-// +build !386
-
 /*
  *
  * Copyright 2021 gRPC authors.
@@ -19,7 +16,6 @@
  *
  */
 
-// Package xds_test contains e2e tests for xDS use.
 package xds_test
 
 import (
@@ -34,10 +30,11 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	xdscreds "google.golang.org/grpc/credentials/xds"
 	"google.golang.org/grpc/internal/testutils"
+	"google.golang.org/grpc/internal/testutils/xds/e2e"
 	"google.golang.org/grpc/xds"
-	"google.golang.org/grpc/xds/internal/testutils/e2e"
 
 	v3listenerpb "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	testgrpc "google.golang.org/grpc/test/grpc_testing"
 	testpb "google.golang.org/grpc/test/grpc_testing"
 )
 
@@ -46,7 +43,7 @@ import (
 // change callback is not invoked and client connections to the server are not
 // recycled.
 func (s) TestServerSideXDS_RedundantUpdateSuppression(t *testing.T) {
-	managementServer, nodeID, bootstrapContents, _, cleanup := setupManagementServer(t)
+	managementServer, nodeID, bootstrapContents, _, cleanup := e2e.SetupManagementServer(t)
 	defer cleanup()
 
 	creds, err := xdscreds.NewServerCredentials(xdscreds.ServerOptions{FallbackCreds: insecure.NewCredentials()})
@@ -68,7 +65,7 @@ func (s) TestServerSideXDS_RedundantUpdateSuppression(t *testing.T) {
 	// Initialize an xDS-enabled gRPC server and register the stubServer on it.
 	server := xds.NewGRPCServer(grpc.Creds(creds), modeChangeOpt, xds.BootstrapContentsForTesting(bootstrapContents))
 	defer server.Stop()
-	testpb.RegisterTestServiceServer(server, &testService{})
+	testgrpc.RegisterTestServiceServer(server, &testService{})
 
 	// Setup the management server to respond with the listener resources.
 	host, port, err := hostPortFromListener(lis)
@@ -115,9 +112,18 @@ func (s) TestServerSideXDS_RedundantUpdateSuppression(t *testing.T) {
 	// suppressed, server will recycle client connections.
 	errCh := make(chan error, 1)
 	go func() {
-		if cc.WaitForStateChange(ctx, connectivity.Ready) {
-			errCh <- fmt.Errorf("unexpected connectivity state change {%s --> %s} on the client connection", connectivity.Ready, cc.GetState())
-			return
+		prev := connectivity.Ready // We know we are READY since we just did an RPC.
+		for {
+			curr := cc.GetState()
+			if !(curr == connectivity.Ready || curr == connectivity.Idle) {
+				errCh <- fmt.Errorf("unexpected connectivity state change {%s --> %s} on the client connection", prev, curr)
+				return
+			}
+			if !cc.WaitForStateChange(ctx, curr) {
+				// Break out of the for loop when the context has been cancelled.
+				break
+			}
+			prev = curr
 		}
 		errCh <- nil
 	}()
@@ -157,7 +163,7 @@ func (s) TestServerSideXDS_RedundantUpdateSuppression(t *testing.T) {
 // xDS enabled gRPC servers. It verifies that appropriate mode changes happen in
 // the server, and also verifies behavior of clientConns under these modes.
 func (s) TestServerSideXDS_ServingModeChanges(t *testing.T) {
-	managementServer, nodeID, bootstrapContents, _, cleanup := setupManagementServer(t)
+	managementServer, nodeID, bootstrapContents, _, cleanup := e2e.SetupManagementServer(t)
 	defer cleanup()
 
 	// Configure xDS credentials to be used on the server-side.
@@ -359,7 +365,7 @@ func (s) TestServerSideXDS_ServingModeChanges(t *testing.T) {
 func waitForSuccessfulRPC(ctx context.Context, t *testing.T, cc *grpc.ClientConn) {
 	t.Helper()
 
-	c := testpb.NewTestServiceClient(cc)
+	c := testgrpc.NewTestServiceClient(cc)
 	if _, err := c.EmptyCall(ctx, &testpb.Empty{}, grpc.WaitForReady(true)); err != nil {
 		t.Fatalf("rpc EmptyCall() failed: %v", err)
 	}
@@ -369,7 +375,7 @@ func waitForFailedRPC(ctx context.Context, t *testing.T, cc *grpc.ClientConn) {
 	t.Helper()
 
 	// Attempt one RPC before waiting for the ticker to expire.
-	c := testpb.NewTestServiceClient(cc)
+	c := testgrpc.NewTestServiceClient(cc)
 	if _, err := c.EmptyCall(ctx, &testpb.Empty{}); err != nil {
 		return
 	}

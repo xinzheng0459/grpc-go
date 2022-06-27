@@ -470,7 +470,7 @@ type test struct {
 	// expose the server's health using the default health service
 	// implementation. This should only be used when a non-default health service
 	// implementation is required.
-	healthServer            healthpb.HealthServer
+	healthServer            healthgrpc.HealthServer
 	maxStream               uint32
 	tapHandle               tap.ServerInHandle
 	maxServerMsgSize        *int
@@ -512,12 +512,12 @@ type test struct {
 	// These are are set once startServer is called. The common case is to have
 	// only one testServer.
 	srv     stopper
-	hSrv    healthpb.HealthServer
+	hSrv    healthgrpc.HealthServer
 	srvAddr string
 
 	// These are are set once startServers is called.
 	srvs     []stopper
-	hSrvs    []healthpb.HealthServer
+	hSrvs    []healthgrpc.HealthServer
 	srvAddrs []string
 
 	cc          *grpc.ClientConn // nil until requested via clientConn
@@ -1508,7 +1508,7 @@ func testFailFast(t *testing.T, e env) {
 
 	cc := te.clientConn()
 	tc := testpb.NewTestServiceClient(cc)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 	if _, err := tc.EmptyCall(ctx, &testpb.Empty{}); err != nil {
 		t.Fatalf("TestService/EmptyCall(_, _) = _, %v, want _, <nil>", err)
@@ -1517,9 +1517,10 @@ func testFailFast(t *testing.T, e env) {
 	te.srv.Stop()
 	// Loop until the server teardown is propagated to the client.
 	for {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := ctx.Err(); err != nil {
+			t.Fatalf("EmptyCall did not return UNAVAILABLE before timeout")
+		}
 		_, err := tc.EmptyCall(ctx, &testpb.Empty{})
-		cancel()
 		if status.Code(err) == codes.Unavailable {
 			break
 		}
